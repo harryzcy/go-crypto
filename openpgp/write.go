@@ -566,6 +566,7 @@ func createSignaturePacket(signer *packet.PublicKey, sigType packet.SignatureTyp
 		Hash:              hash,
 		CreationTime:      config.Now(),
 		IssuerKeyId:       &signer.KeyId,
+		IssuerKeyVersion:  uint8(signer.Version),
 		IssuerFingerprint: signer.Fingerprint,
 		Notations:         config.Notations(),
 		SigLifetimeSecs:   &sigLifetimeSecs,
