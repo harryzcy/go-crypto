@@ -23,6 +23,10 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/errors"
 	"github.com/ProtonMail/go-crypto/openpgp/internal/algorithm"
 	"github.com/ProtonMail/go-crypto/openpgp/internal/encoding"
+	"github.com/ProtonMail/go-crypto/openpgp/mldsa_eddsa"
+	"github.com/ProtonMail/go-crypto/openpgp/slhdsa"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
 )
 
 const (
@@ -81,6 +85,8 @@ type Signature struct {
 	ECDSASigR, ECDSASigS encoding.Field
 	EdDSASigR, EdDSASigS encoding.Field
 	EdSig                []byte
+	MldsaSig             []byte
+	SlhdsaSig            []byte
 
 	// rawSubpackets contains the unparsed subpackets, in order.
 	rawSubpackets []outputSubpacket
@@ -200,7 +206,11 @@ func (sig *Signature) parse(r io.Reader) (err error) {
 	sig.SigType = SignatureType(buf[0])
 	sig.PubKeyAlgo = PublicKeyAlgorithm(buf[1])
 	switch sig.PubKeyAlgo {
-	case PubKeyAlgoRSA, PubKeyAlgoRSASignOnly, PubKeyAlgoDSA, PubKeyAlgoECDSA, PubKeyAlgoEdDSA, PubKeyAlgoEd25519, PubKeyAlgoEd448:
+	case PubKeyAlgoRSA, PubKeyAlgoRSASignOnly, PubKeyAlgoDSA,
+		PubKeyAlgoECDSA, PubKeyAlgoEdDSA,
+		PubKeyAlgoEd25519, PubKeyAlgoEd448,
+		PubKeyAlgoMldsa65Ed25519, PubKeyAlgoMldsa87Ed448,
+		PubKeyAlgoSlhdsaShake128s, PubKeyAlgoSlhdsaShake128f, PubKeyAlgoSlhdsaShake256s:
 	default:
 		err = errors.UnsupportedError("public key algorithm " + strconv.Itoa(int(sig.PubKeyAlgo)))
 		return
@@ -338,9 +348,45 @@ func (sig *Signature) parse(r io.Reader) (err error) {
 		if err != nil {
 			return
 		}
+	case PubKeyAlgoMldsa65Ed25519:
+		if err = sig.parseMldsaEddsaSignature(r, 64, mldsa65.SignatureSize); err != nil {
+			return
+		}
+	case PubKeyAlgoMldsa87Ed448:
+		if err = sig.parseMldsaEddsaSignature(r, 114, mldsa87.SignatureSize); err != nil {
+			return
+		}
+	case PubKeyAlgoSlhdsaShake128s, PubKeyAlgoSlhdsaShake128f, PubKeyAlgoSlhdsaShake256s:
+		if err = sig.parseSlhdsaSignature(r, sig.PubKeyAlgo); err != nil {
+			return
+		}
 	default:
 		panic("unreachable")
 	}
+	return
+}
+
+// parseMldsaEddsaSignature parses an ML-DSA + EdDSA signature as specified in
+// https://www.rfc-editor.org/rfc/rfc9980.html#name-signature-packet-packet-typ
+func (sig *Signature) parseMldsaEddsaSignature(r io.Reader, ecLen, dLen int) (err error) {
+	sig.EdSig = make([]byte, ecLen)
+	if _, err = io.ReadFull(r, sig.EdSig); err != nil {
+		return
+	}
+
+	sig.MldsaSig = make([]byte, dLen)
+	_, err = io.ReadFull(r, sig.MldsaSig)
+	return
+}
+
+// parseSlhdsaSignature parses an SLH-DSA signature as specified in
+func (sig *Signature) parseSlhdsaSignature(r io.Reader, algID PublicKeyAlgorithm) (err error) {
+	scheme, err := GetSlhdsaSchemeFromAlgID(algID)
+	if err != nil {
+		return err
+	}
+	sig.SlhdsaSig = make([]byte, scheme.SignatureSize())
+	_, err = io.ReadFull(r, sig.SlhdsaSig)
 	return
 }
 
@@ -1000,6 +1046,27 @@ func (sig *Signature) Sign(h hash.Hash, priv *PrivateKey, config *Config) (err e
 		if err == nil {
 			sig.EdSig = signature
 		}
+	case PubKeyAlgoMldsa65Ed25519, PubKeyAlgoMldsa87Ed448:
+		if sig.Version != 6 {
+			return errors.StructuralError("cannot use MldsaEdDsa on a non-v6 signature")
+		}
+		sk := priv.PrivateKey.(*mldsa_eddsa.PrivateKey)
+		dSig, ecSig, err := mldsa_eddsa.Sign(sk, digest)
+
+		if err == nil {
+			sig.MldsaSig = dSig
+			sig.EdSig = ecSig
+		}
+	case PubKeyAlgoSlhdsaShake128s, PubKeyAlgoSlhdsaShake128f, PubKeyAlgoSlhdsaShake256s:
+		if sig.Version != 6 {
+			return errors.StructuralError("cannot use SLH-DSA on a non-v6 signature")
+		}
+		sk := priv.PrivateKey.(*slhdsa.PrivateKey)
+		dSig, err := slhdsa.Sign(sk, digest)
+
+		if err == nil {
+			sig.SlhdsaSig = dSig
+		}
 	default:
 		err = errors.UnsupportedError("public key algorithm: " + strconv.Itoa(int(sig.PubKeyAlgo)))
 	}
@@ -1117,7 +1184,7 @@ func (sig *Signature) Serialize(w io.Writer) (err error) {
 	if len(sig.outSubpackets) == 0 {
 		sig.outSubpackets = sig.rawSubpackets
 	}
-	if sig.RSASignature == nil && sig.DSASigR == nil && sig.ECDSASigR == nil && sig.EdDSASigR == nil && sig.EdSig == nil {
+	if sig.RSASignature == nil && sig.DSASigR == nil && sig.ECDSASigR == nil && sig.EdDSASigR == nil && sig.EdSig == nil && sig.SlhdsaSig == nil {
 		return errors.InvalidArgumentError("Signature: need to call Sign, SignUserId or SignKey before Serialize")
 	}
 
@@ -1138,6 +1205,11 @@ func (sig *Signature) Serialize(w io.Writer) (err error) {
 		sigLength = ed25519.SignatureSize
 	case PubKeyAlgoEd448:
 		sigLength = ed448.SignatureSize
+	case PubKeyAlgoMldsa65Ed25519, PubKeyAlgoMldsa87Ed448:
+		sigLength = len(sig.EdSig)
+		sigLength += len(sig.MldsaSig)
+	case PubKeyAlgoSlhdsaShake128s, PubKeyAlgoSlhdsaShake128f, PubKeyAlgoSlhdsaShake256s:
+		sigLength += len(sig.SlhdsaSig)
 	default:
 		panic("impossible")
 	}
@@ -1244,6 +1316,13 @@ func (sig *Signature) serializeBody(w io.Writer) (err error) {
 		err = ed25519.WriteSignature(w, sig.EdSig)
 	case PubKeyAlgoEd448:
 		err = ed448.WriteSignature(w, sig.EdSig)
+	case PubKeyAlgoMldsa65Ed25519, PubKeyAlgoMldsa87Ed448:
+		if _, err = w.Write(sig.EdSig); err != nil {
+			return
+		}
+		_, err = w.Write(sig.MldsaSig)
+	case PubKeyAlgoSlhdsaShake128s, PubKeyAlgoSlhdsaShake128f, PubKeyAlgoSlhdsaShake256s:
+		_, err = w.Write(sig.SlhdsaSig)
 	default:
 		panic("impossible")
 	}
